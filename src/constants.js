@@ -1,21 +1,24 @@
+/**
+ * Application-wide constants and model configuration.
+ *
+ * API_ENDPOINTS holds the REST API base URLs.
+ * OPENAI_MODELS, ANTHROPIC_MODELS, and REASONING_MODELS are lists loaded from shared/models.json.
+ * Note: REASONING_MODELS is used by the backend to determine temperature settings.
+ */
+import modelConfig from "../shared/models.json";
+
 export const API_ENDPOINTS = {
   CONVERSATIONS: "http://localhost:5005/api/conversations",
   MESSAGES: "http://localhost:5005/api/messages",
+  AUTH: {
+    LOGIN: "http://localhost:5005/api/auth/login",
+    REGISTER: "http://localhost:5005/api/auth/register",
+    ME: "http://localhost:5005/api/auth/me",
+  },
 };
 
-export const MODEL_INDICATORS = {
-  GPT: "H",
-  CLAUDE: "C",
-};
+export const OPENAI_MODELS = modelConfig.openai_models;
 
-// List of available OpenAI models for selection in the UI
-export const OPENAI_MODELS = [
-  "gpt-4.1-2025-04-14",
-  "o4-mini",
-];
+export const ANTHROPIC_MODELS = modelConfig.anthropic_models;
 
-// List of available Anthropic Claude models for selection in the UI
-export const ANTHROPIC_MODELS = [
-  "claude-sonnet-4-0",
-  "claude-opus-4-0",
-];
+export const REASONING_MODELS = modelConfig.reasoning_models;

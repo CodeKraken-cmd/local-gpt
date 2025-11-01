@@ -6,13 +6,4 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-  }
-
-.delete-toggle {
-    display: flex;
-    align-items: center;
-  }
-  
-  .delete-toggle input[type="checkbox"] {
-    margin-right: 8px;
-  }
+}

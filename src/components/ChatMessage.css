@@ -1,37 +1,128 @@
-/* src/components/ChatMessage.css */
 .chat-message {
-    max-width: 70%; /* Max width of message bubbles */
-    padding: 10px 15px;
-    margin-bottom: 10px;
-    border-radius: 15px;
-    word-wrap: break-word; /* Ensure long words break */
-    line-height: 1.4;
-  }
+  position: relative;
+  display: block;
+  max-width: 70%;
+  padding: 10px 15px;
+  border-radius: 15px;
+  word-wrap: break-word;
+  line-height: 1.4;
+}
 
-  .chat-message p {
-    margin: 0; /* Remove default top/bottom paragraph margins */
-  }
-  
-  .user-message {
-    background-color: #78909C; /* NEW - Muted Blue-Grey */
-    color: white;
-    margin-left: auto; /* Align to the right */
-    margin-right: 10px; /* Add some spacing from the edge */
-    border-bottom-right-radius: 5px; /* Slightly different shape */
-  }
-  
-  .assistant-message {
-    background-color: #D1D5DB; /* NEW - Slightly darker Cool Grey */
-    color: #333;
-    margin-right: auto; /* Align to the left */
-    margin-left: 10px; /* Add some spacing from the edge */
-    border-bottom-left-radius: 5px; /* Slightly different shape */
-  }
-  
-  .message-content {
-      /* Styles specifically for the content inside the bubble if needed */
-      /* For ReactMarkdown generated elements: */
-      & p { margin-bottom: 0; } /* Remove default paragraph margin */
-      & code { background-color: rgba(0,0,0,0.1); padding: 2px 4px; border-radius: 4px; }
-      & pre { background-color: rgba(0,0,0,0.1); padding: 10px; border-radius: 4px; overflow-x: auto;}
-  }
+.chat-message p {
+  margin: 0;
+}
+
+.user-message {
+  background-color: #78909C;
+  color: white;
+  margin: 0;
+  border-bottom-left-radius: 5px;
+  max-width: none;
+  width: auto;
+}
+
+.assistant-message {
+  background-color: #D1D5DB;
+  color: #333;
+  margin: 0;
+  max-width: none;
+  width: auto;
+  border-bottom-right-radius: 5px;
+}
+
+.assistant-message.anthropic-message {
+  background-color: #FFD6AE;
+}
+
+.message-content p {
+  margin-bottom: 0;
+}
+
+.message-content code {
+  background-color: rgba(0,0,0,0.1);
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.message-content pre {
+  background-color: rgba(0,0,0,0.1);
+  padding: 10px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.chat-message .model-badge {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  background-color: rgba(0, 0, 0, 0.75);
+  color: #333;
+  padding: 2px 6px;
+  font-size: 0.75rem;
+  border-radius: 8px;
+  opacity: 0;
+  transition: opacity 0.2s ease-in-out;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 10;
+}
+
+.chat-message:hover .model-badge {
+  opacity: 1;
+}
+
+.assistant-message .model-badge {
+  background-color: #E2E6EB;
+}
+
+.assistant-message.anthropic-message .model-badge {
+  background-color: #FFE2BA;
+}
+
+.collapse-icon {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  opacity: 0;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.9rem;
+  background-color: rgba(255, 255, 255, 0.6);
+  border-radius: 4px;
+  padding: 2px;
+  transition: opacity 0.2s ease-in-out;
+}
+
+.chat-message:hover .collapse-icon {
+  opacity: 1;
+}
+
+/* Toggle visibility of child messages */
+.children-toggle-icon {
+  position: absolute;
+  top: 50%;
+  left: -28px;
+  transform: translateY(-50%);
+  opacity: 0;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.9rem;
+  background-color: rgba(255, 255, 255, 0.6);
+  color: #333;
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.2s ease-in-out;
+}
+
+.message-node.selected-node > .chat-message .children-toggle-icon {
+  left: -32px;
+}
+
+.chat-message:hover .children-toggle-icon {
+  opacity: 1;
+}
+

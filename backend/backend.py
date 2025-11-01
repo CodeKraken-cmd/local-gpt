@@ -1,18 +1,33 @@
-from datetime import datetime
-import json
+"""
+Flask backend for Local-GPT.
 
+Provides endpoints for:
+- managing conversations and messages.
+- streaming LLM responses via Server-Sent Events (SSE).
+- database connection pooling and CORS preflight handling.
+"""
+
+from datetime import datetime, timedelta
+import functools
+import json
+import pathlib
+import os
+
+import anthropic
+import bcrypt
 import flask
 from flask import request as flask_request
 from flask.wrappers import Response as flaskResponse
 import flask_cors
+import jwt
 import openai
-import anthropic
 import psycopg2.extensions, psycopg2.extras, psycopg2.pool
 
-# Setup connection pool
+
+## Connection pool for PostgreSQL database.
 postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(
-    1,  # minconn
-    20,  # maxconn
+    1,
+    20,
     user="seth",
     password="newpassword",
     host="localhost",
@@ -24,21 +39,94 @@ postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(
 FLASK_APP = flask.Flask(__name__)
 flask_cors.CORS(FLASK_APP)
 
+# JWT configuration
+JWT_SECRET_KEY = os.environ.get(
+    'JWT_SECRET_KEY', 'your-secret-key-change-in-production'
+)
+JWT_ALGORITHM = 'HS256'
+
 
 OPENAI = openai.OpenAI()
 OPEN_AI_CHAT_COMPLETIONS_CLIENT = OPENAI.chat.completions
 
-# ---------- Anthropic (Claude) setup -------------------------------------
-ANTHROPIC_CLIENT = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+current_filepath = pathlib.Path(__file__).resolve()
+config_filepath = current_filepath.parent.parent / "shared" / "models.json"
+MODEL_CONFIG = json.loads(config_filepath.read_text())
 
-# Default Anthropic Claude model, used if no specific model chosen
+ANTHROPIC_CLIENT = anthropic.Anthropic()
 MAX_ANTHROPIC_TOKENS = 8192
+ANTHROPIC_MODELS = set(MODEL_CONFIG["anthropic_models"])
 
-# Supported Anthropic Claude models
-ANTHROPIC_MODELS = {"claude-sonnet-4-0", "claude-opus-4-0"}
-# -------------------------------------------------------------------------
+OPENAI_MODELS = set(MODEL_CONFIG["openai_models"])
 
-NO_TEMPERATURE_MODELS = {"o4-mini"}
+REASONING_MODELS = set(MODEL_CONFIG["reasoning_models"])
+
+
+# Authentication helper functions
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against its hash."""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+
+def generate_token(user_id: int, email: str, is_admin: bool) -> str:
+    """
+    Generate a JWT token for a user.
+    
+    JWT tokens are used instead of sessions because:
+    - They're stateless (no server-side storage needed)
+    - They contain user info (id, email, admin status) for quick access
+    - They have built-in expiration (7 days) for security
+    - They can be easily verified without database lookups
+    """
+    payload = {
+        'user_id': user_id,
+        'email': email,
+        'is_admin': is_admin,
+        'exp': datetime.utcnow() + timedelta(days=7),  # Token expires in 7 days
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def verify_token(token: str) -> dict | None:
+    """
+    Verify and decode a JWT token.
+    
+    This function is called on every protected route and during app startup
+    to ensure tokens are still valid and haven't expired.
+    Returns None for expired or invalid tokens, triggering re-authentication.
+    """
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+def require_auth(f):
+    """Decorator to require authentication for an endpoint."""
+
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = flask_request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return flask.jsonify({'error': 'No token provided'}), 401
+
+        token = auth_header.split(' ')[1]
+        payload = verify_token(token)
+        if not payload:
+            return flask.jsonify({'error': 'Invalid or expired token'}), 401
+
+        flask_request.current_user = payload
+        return f(*args, **kwargs)
+
+    return decorated_function
 
 
 def _anthropic_call(
@@ -49,6 +137,10 @@ def _anthropic_call(
     max_tokens: int,
     stream: bool = False,
 ):
+    """
+    Call the Anthropic API for chat completions with optional system prompt and
+    streaming.
+    """
     params = {"model": model, "max_tokens": max_tokens, "messages": messages}
     if system_prompt:
         params["system"] = system_prompt
@@ -60,29 +152,35 @@ def _anthropic_call(
 @FLASK_APP.route("/stream", methods=["GET"])
 def stream_interaction() -> flaskResponse:
     """
-    1. Creates a new conversation in the DB.
-    2. Saves user/system messages.
-    3. Streams partial tokens from OpenAI.
-    4. Once streaming is done, saves the assistant's final message to DB.
+    Stream an OpenAI or Anthropic LLM response via Server-Sent Events (SSE).
+
+    Steps:
+    1. Create or continue a conversation record in the database.
+    2. Save user and optional system messages.
+    3. Stream tokens from the chosen LLM to the client in real time.
+    4. Persist the final assistant message after streaming completes.
     """
     user_text = flask_request.args.get("userText", "")
-    # Still useful for the *start* of a convo
     system_message = flask_request.args.get("systemMessage", "")
-    # Optional ID from frontend
     conversation_id_str = flask_request.args.get("conversationId")
-    # Get LLM model choice from query params; default to gpt-4.1-2025-04-14
     llm_choice = flask_request.args.get("llm", "gpt-4.1-2025-04-14")
+    parent_message_id_str = flask_request.args.get("parentMessageId")
+    try:
+        parent_message_id = (
+            int(parent_message_id_str) if parent_message_id_str is not None else None
+        )
+    except (ValueError, TypeError):
+        parent_message_id = None
 
     conn = None
     cur = None
     conversation_id = None
     is_new_conversation = True
     messages_for_llm = []
+    user_message_id = None
 
-    # We'll create a new conversation topic from the date/time:
     conversation_topic = _get_current_date_and_time_string()
 
-    # Insert the conversation and user/system messages in DB
     conn = None
     cur = None
     conversation_id = None
@@ -97,19 +195,36 @@ def stream_interaction() -> flaskResponse:
                 is_new_conversation = False
                 print(f"Continuing conversation ID: {conversation_id}")
 
-                # Fetch existing messages for the context
                 cur.execute(
-                    """SELECT sender_name, message_text
-                       FROM messages
-                       WHERE conversation_id = %s
-                       ORDER BY sent_at ASC""",  # Important: maintain order
+                    """
+                    SELECT id, parent_message_id, sender_name, message_text, sent_at
+                    FROM messages
+                    WHERE conversation_id = %s
+                    ORDER BY sent_at ASC
+                    """,
                     (conversation_id,),
                 )
                 existing_messages = cur.fetchall()
 
-                for sender, text in existing_messages:
+                if parent_message_id is not None:
+                    # Filter to only include the selected branch path and system messages
+                    id_map = {m[0]: m for m in existing_messages}
+                    path_ids = set()
+                    curr = parent_message_id
+                    while curr is not None and curr in id_map:
+                        path_ids.add(curr)
+                        curr = id_map[curr][1]
+                    existing_messages = [
+                        m
+                        for m in existing_messages
+                        if m[0] in path_ids or m[2] == "system"
+                    ]
+
+                for m in existing_messages:
+                    sender = m[2]
+                    text = m[3]
                     if sender == "system" and system_message == "":
-                        system_message = text  # keep only the first one
+                        system_message = text
                     else:
                         messages_for_llm.append({"role": sender, "content": text})
 
@@ -119,79 +234,78 @@ def stream_interaction() -> flaskResponse:
                     "Starting new conversation."
                 )
                 is_new_conversation = True
-                conversation_id = None  # Reset ID
+                conversation_id = None
 
-        # If it's a new conversation, create it
         if is_new_conversation:
             conversation_topic = _get_current_date_and_time_string()
             cur.execute(
-                "INSERT INTO conversations (conversation_topic) "
-                "VALUES (%s) RETURNING id",
+                """
+                INSERT INTO conversations (conversation_topic)
+                VALUES (%s) RETURNING id
+                """,
                 (conversation_topic,),
             )
             conversation_id_row = cur.fetchone()
-            # Good practice to check if anything was returned
             if not conversation_id_row:
                 raise Exception(
                     "Failed to create new conversation and retrieve ID after INSERT."
                 )
-            # Access the first element of the tuple
             conversation_id = conversation_id_row[0]
 
-            # Add system message to DB and LLM context (if provided)
             if system_message:
                 cur.execute(
-                    "INSERT INTO messages (conversation_id, message_text, sender_name) "
-                    "VALUES (%s, %s, %s)",
+                    """
+                    INSERT INTO messages (conversation_id, message_text, sender_name)
+                    VALUES (%s, %s, %s)
+                    """,
                     (conversation_id, system_message, "system"),
                 )
-            # Commit conversation creation and system message
 
-        # --- Always add the *current* user message ---
         messages_for_llm.append({"role": "user", "content": user_text})
 
-        # --- Always save the *current* user message to DB ---
         cur.execute(
-            "INSERT INTO messages "
-            "(conversation_id, message_text, sender_name) VALUES (%s, %s, %s)",
-            (conversation_id, user_text, "user"),
+            """
+            INSERT INTO messages 
+                (conversation_id, message_text, sender_name, parent_message_id)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (conversation_id, user_text, "user", parent_message_id),
         )
-        conn.commit()  # Commit user message *before* streaming starts
+        user_message_id = cur.fetchone()[0]
+        conn.commit()
 
     except Exception as e:
         print(f"Error preparing conversation (ID: {conversation_id}): {e}")
         if conn:
             conn.rollback()
-        # How to handle error response here? Maybe yield an error event.
         error_data = json.dumps({"error": "Failed to prepare conversation"})
         return flask.Response(f"data: {error_data}\n\n", mimetype="text/event-stream")
     finally:
-        # Close cursor early, keep connection for generator if needed for saving later
         if cur:
             cur.close()
-        # Don't release connection yet if needed in `generate` for saving the assistant
-        # message
+        if conn:
+            release_db_connection(conn)
 
-    # SSE generator
-    # Pass conversation_id explicitly
     def generate(conv_id, chosen_llm):
         assistant_message_accumulator = []
-        print(f"Starting generation for conversation ID: {conv_id}")  # Add log
+        print(f"Starting generation for conversation ID: {conv_id}")
 
-        # Send initial message indicating new conversation ID if needed
         if is_new_conversation:
             new_convo_data = json.dumps({"new_conversation_id": conv_id})
             yield f"data: {new_convo_data}\n\n"
 
-        # Determine which OpenAI model to use for chat completions
+        # Inform client of the user message ID for branching
+        if user_message_id is not None:
+            user_msg_data = json.dumps({"user_message_id": user_message_id})
+            yield f"data: {user_msg_data}\n\n"
+
         model_to_use = chosen_llm
 
         try:
             if model_to_use in ANTHROPIC_MODELS:
-                # 1. Build complete history once, including previous DB turns
-                anthro_messages = messages_for_llm[:]  # already in alternating order
+                anthro_messages = messages_for_llm[:]
                 anthro_messages = [m for m in messages_for_llm if m["role"] != "system"]
-                # 2. Stream from Claude
                 with _anthropic_call(
                     model=model_to_use,
                     messages=anthro_messages,
@@ -205,20 +319,18 @@ def stream_interaction() -> flaskResponse:
                             assistant_message_accumulator.append(tok)
                             yield f"data: {json.dumps({'token': tok})}\n\n"
             else:
-                # Prepend system turn for ChatGPT / GPT-4, if one exists
                 openai_messages = (
                     [{"role": "system", "content": system_message}]
                     if system_message
                     else []
                 ) + messages_for_llm
-                # --- Send accumulated history to OpenAI ---
                 params = {
                     "model": model_to_use,
                     "messages": openai_messages,
                     "max_completion_tokens": 1024,
                     "stream": True,
                 }
-                if model_to_use not in NO_TEMPERATURE_MODELS:
+                if model_to_use not in REASONING_MODELS:
                     params["temperature"] = 0.8
                 response = OPEN_AI_CHAT_COMPLETIONS_CLIENT.create(**params)
 
@@ -237,31 +349,53 @@ def stream_interaction() -> flaskResponse:
             yield f"data: {error_data}\n\n"
 
         finally:
-            # Once the stream is complete, store the final assistant text in DB
             final_assistant_text = "".join(assistant_message_accumulator)
-            # Add log
             print(
                 f"Finished streaming for conv {conv_id}. Final text length: "
                 f"{len(final_assistant_text)}"
             )
 
-            # Check we have ID and text
             if conv_id is not None and final_assistant_text:
                 conn2 = None
-                cur2 = None  # Define cur2 before try block
+                cur2 = None
                 try:
-                    # Add log
                     print(f"Attempting to save final message for conv {conv_id}")
                     conn2 = get_db_connection()
                     cur2 = conn2.cursor()
-                    cur2.execute(
-                        "INSERT INTO messages "
-                        "(conversation_id, message_text, sender_name, llm_model) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (conv_id, final_assistant_text, "assistant", chosen_llm),
+                    provider = (
+                        "anthropic" if chosen_llm in ANTHROPIC_MODELS else "openai"
                     )
+                    cur2.execute(
+                        """
+                        INSERT INTO messages (
+                            conversation_id,
+                            message_text,
+                            sender_name,
+                            llm_model,
+                            llm_provider,
+                            parent_message_id
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            conv_id,
+                            final_assistant_text,
+                            "assistant",
+                            chosen_llm,
+                            provider,
+                            user_message_id,
+                        ),
+                    )
+                    assistant_msg_row = cur2.fetchone()
                     conn2.commit()
-                    # Add log
+                    if assistant_msg_row:
+                        assistant_msg_id = assistant_msg_row[0]
+                        # Inform client of the assistant message ID for branching
+                        assistant_id_data = json.dumps(
+                            {"assistant_message_id": assistant_msg_id}
+                        )
+                        yield f"data: {assistant_id_data}\n\n"
                     print(f"Successfully saved final message for conv {conv_id}")
                 except Exception as e:
                     print(
@@ -279,12 +413,9 @@ def stream_interaction() -> flaskResponse:
                 print("Skipping final save: conversation_id is None.")
             else:
                 print(
-                    f"Skipping final save for conv {conv_id}: No assistant text "
-                    "generated."
+                    f"Skipping final save for conv {conv_id}: No assistant text generated."
                 )
 
-    # Return an EventStream (SSE) response
-    # Pass the conversation_id obtained earlier to the generator
     return flask.Response(
         generate(conversation_id, llm_choice), mimetype="text/event-stream"
     )
@@ -292,17 +423,22 @@ def stream_interaction() -> flaskResponse:
 
 @FLASK_APP.route("/api/conversations", methods=['GET'])
 def get_conversations() -> flaskResponse:
+    """
+    GET /api/conversations
+
+    Return a list of all conversations with their IDs and topics.
+    """
     conn = None
-    cur = None  # Initialize cur to None
+    cur = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            '''
-            SELECT id, conversation_topic 
-            FROM conversations 
+            """
+            SELECT id, conversation_topic
+            FROM conversations
             ORDER BY created_at DESC
-            '''
+            """
         )
         conversations = cur.fetchall()
         return flask.jsonify(
@@ -319,31 +455,44 @@ def get_conversations() -> flaskResponse:
 
 @FLASK_APP.route("/api/messages/<int:conversation_id>", methods=['GET'])
 def get_messages(conversation_id: int) -> flaskResponse:
+    """
+    GET /api/messages/<conversation_id>
+
+    Return all messages for a given conversation in chronological order.
+    """
     conn = None
-    cur = None  # Initialize cur to None
+    cur = None
     try:
         conn = get_db_connection()
-        # Use RealDictCursor for dict-like rows
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            """SELECT id, message_text, sender_name, sent_at, llm_model
-               FROM messages
-               WHERE conversation_id = %s
-               ORDER BY sent_at ASC""",
+            """
+            SELECT 
+                id, 
+                message_text, 
+                sender_name, 
+                sent_at, 
+                llm_model, 
+                llm_provider, 
+                parent_message_id
+            FROM messages
+            WHERE conversation_id = %s
+            ORDER BY sent_at ASC
+            """,
             (conversation_id,),
         )
         messages_raw = cur.fetchall()
-        # Map to frontend expected structure if needed, or ensure frontend adapts
         messages_processed = []
         for msg in messages_raw:
             messages_processed.append(
                 {
-                    'id': msg['id'],  # Good to have message ID on frontend
+                    'id': msg['id'],
                     'text': msg['message_text'],
                     'sender': msg['sender_name'],
-                    # Send timestamp as ISO string
                     'sent_at': msg['sent_at'].isoformat(),
-                    'llm_model': msg['llm_model'],  # Include llm_model
+                    'llm_model': msg['llm_model'],
+                    'llm_provider': msg['llm_provider'],
+                    'parent_message_id': msg.get('parent_message_id'),
                 }
             )
         return flask.jsonify(messages_processed)
@@ -358,6 +507,11 @@ def get_messages(conversation_id: int) -> flaskResponse:
 
 @FLASK_APP.route("/api/conversations/<int:id>", methods=['PUT'])
 def update_conversation(id: int) -> flaskResponse:
+    """
+    PUT /api/conversations/<id>
+
+    Update the topic of the specified conversation. Expects JSON body with 'topic'.
+    """
     data = flask_request.json
     topic = data.get('topic')
     conn = None
@@ -383,12 +537,16 @@ def update_conversation(id: int) -> flaskResponse:
 
 @FLASK_APP.route("/api/conversations/<int:id>", methods=['DELETE'])
 def delete_conversation(id: int) -> flaskResponse:
+    """
+    DELETE /api/conversations/<id>
+
+    Delete the specified conversation and all associated messages.
+    """
     conn = None
-    cur = None  # Initialize cur to None
+    cur = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Delete messages first due to foreign key constraint
         cur.execute("DELETE FROM messages WHERE conversation_id = %s", (id,))
         cur.execute("DELETE FROM conversations WHERE id = %s", (id,))
         conn.commit()
@@ -404,31 +562,151 @@ def delete_conversation(id: int) -> flaskResponse:
             release_db_connection(conn)
 
 
-def _build_cors_preflight_response() -> flaskResponse:
-    response = flask.jsonify({})
-    response_headers = response.headers
-    response_headers.add('Access-Control-Allow-Origin', '*')
-    response_headers.add(
-        'Access-Control-Allow-Headers',
-        "Origin, X-Requested-With, Content-Type, Accept, Authorization",
+@FLASK_APP.route("/api/auth/register", methods=['POST'])
+def register() -> flaskResponse:
+    """
+    POST /api/auth/register
+
+    Register a new user with email and password.
+    """
+    data = flask_request.get_json()
+    if not data or not data.get('email') or not data.get('password'):
+        return flask.jsonify({'error': 'Email and password are required'}), 400
+
+    email = data['email'].lower().strip()
+    password = data['password']
+
+    if len(password) < 6:
+        return (
+            flask.jsonify({'error': 'Password must be at least 6 characters long'}),
+            400,
+        )
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Check if user already exists
+        cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+        if cur.fetchone():
+            return flask.jsonify({'error': 'User with this email already exists'}), 400
+
+        # Create new user
+        password_hash = hash_password(password)
+        cur.execute(
+            "INSERT INTO users (email, password_hash) VALUES (%s, %s) "
+            "RETURNING id, is_admin",
+            (email, password_hash),
+        )
+        user_id, is_admin = cur.fetchone()
+        conn.commit()
+
+        # Generate token
+        token = generate_token(user_id, email, is_admin)
+
+        return flask.jsonify(
+            {
+                'token': token,
+                'user': {'id': user_id, 'email': email, 'is_admin': is_admin},
+            }
+        )
+
+    except Exception as e:
+        print("Error registering user:", e)
+        if conn:
+            conn.rollback()
+        return flask.jsonify({'error': 'Internal Server Error'}), 500
+    finally:
+        if conn:
+            cur.close()
+            release_db_connection(conn)
+
+
+@FLASK_APP.route("/api/auth/login", methods=['POST'])
+def login() -> flaskResponse:
+    """
+    POST /api/auth/login
+
+    Login with email and password.
+    """
+    data = flask_request.get_json()
+    if not data or not data.get('email') or not data.get('password'):
+        return flask.jsonify({'error': 'Email and password are required'}), 400
+
+    email = data['email'].lower().strip()
+    password = data['password']
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Find user
+        cur.execute(
+            "SELECT id, password_hash, is_admin FROM users WHERE email = %s", (email,)
+        )
+        user = cur.fetchone()
+
+        if not user or not verify_password(password, user[1]):
+            return flask.jsonify({'error': 'Invalid email or password'}), 401
+
+        user_id, _, is_admin = user
+
+        # Generate token
+        token = generate_token(user_id, email, is_admin)
+
+        return flask.jsonify(
+            {
+                'token': token,
+                'user': {'id': user_id, 'email': email, 'is_admin': is_admin},
+            }
+        )
+
+    except Exception as e:
+        print("Error logging in user:", e)
+        return flask.jsonify({'error': 'Internal Server Error'}), 500
+    finally:
+        if conn:
+            cur.close()
+            release_db_connection(conn)
+
+
+@FLASK_APP.route("/api/auth/me", methods=['GET'])
+@require_auth
+def get_current_user() -> flaskResponse:
+    """
+    GET /api/auth/me
+
+    Get current user information from token.
+    """
+    user = flask_request.current_user
+    return flask.jsonify(
+        {
+            'user': {
+                'id': user['user_id'],
+                'email': user['email'],
+                'is_admin': user['is_admin'],
+            }
+        }
     )
-    response_headers.add('Access-Control-Allow-Methods', "GET, POST, PATCH, DELETE")
-    return response
 
 
 def _get_current_date_and_time_string() -> str:
-    # Get the current date and time
+    """Return the current date and time as a human-readable string."""
     now = datetime.now()
-
-    # Format the date and time
     return now.strftime("%B %d, %Y, %-I:%M %p")
 
 
 def get_db_connection() -> psycopg2.extensions.connection:
+    """Get a database connection from the PostgreSQL pool."""
     return postgreSQL_pool.getconn()
 
 
 def release_db_connection(conn: psycopg2.extensions.connection) -> None:
+    """Release a database connection back to the PostgreSQL pool."""
     postgreSQL_pool.putconn(conn)
 
 
