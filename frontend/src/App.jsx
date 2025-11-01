@@ -11,6 +11,7 @@ import {
   useConversation,
 } from "./contexts/ConversationContext";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
+import SettingsPage from "./components/SettingsPage";
 import ConversationPanel from "./components/ConversationPanel";
 import StreamingIndicator from "./components/StreamingIndicator";
 import ControlPanel from "./components/ControlPanel";
@@ -19,6 +20,7 @@ import DeleteModeToggle from "./components/DeleteModeToggle";
 import LoginButton from "./components/LoginButton";
 import api from "./api";
 
+import { API_ENDPOINTS } from "./constants";
 const AppContent = () => {
   const [isStreaming, setIsStreaming] = useState(false);
   const [editState, setEditState] = useState({ id: null, text: "" });
@@ -34,11 +36,19 @@ const AppContent = () => {
     fetchConversations,
     loadConversationMessages,
     selectedLLM,
+    setSelectedLLM,
     selectedParentId,
     setSelectedParentId,
   } = useConversation();
 
-  const { isAdmin, loading } = useAuth();
+  const { isAdmin, loading, isAuthenticated } = useAuth();
+  const [showSettings, setShowSettings] = useState(false);
+  // Highlight the login button briefly when an unauthenticated user attempts to type
+  const [loginHighlight, setLoginHighlight] = useState(false);
+  const triggerLoginHighlight = () => {
+    setLoginHighlight(true);
+    setTimeout(() => setLoginHighlight(false), 500);
+  };
 
   // Scroll to the end of the chat when new messages arrive.
   useEffect(() => {
@@ -56,6 +66,11 @@ const AppContent = () => {
   // This prevents UI flicker and ensures proper authentication state
   if (loading) {
     return <div className="loading">Loading...</div>;
+  }
+
+  // Show settings page when requested
+  if (showSettings) {
+    return <SettingsPage onClose={() => setShowSettings(false)} />;
   }
 
   // Toggle delete mode to enable removing conversations.
@@ -92,7 +107,8 @@ const AppContent = () => {
       eventSourceRef.current = null;
     }
 
-    const baseUrl = "http://localhost:5005/stream";
+    // Stream endpoint from constants
+    const baseUrl = API_ENDPOINTS.STREAM;
     // Construct URL parameters: always include user text and add system message only
     // when starting a new conversation.
     const urlParams = new URLSearchParams({
@@ -106,6 +122,12 @@ const AppContent = () => {
     urlParams.append("llm", selectedLLM);
     if (currentConversation.id != null && selectedParentId != null) {
       urlParams.append("parentMessageId", selectedParentId);
+    }
+
+    // Append auth token for SSE authentication
+    const token = localStorage.getItem("auth_token");
+    if (token) {
+      urlParams.append("token", token);
     }
 
     const url = `${baseUrl}?${urlParams.toString()}`;
@@ -210,6 +232,12 @@ const AppContent = () => {
           setSelectedParentId(newAssistId);
           return;
         }
+        // Handle stream completion signal
+        if (parsed.stream_complete) {
+          console.log("Stream completed successfully");
+          handleClose(false); // Normal completion - not an error
+          return;
+        }
         // Only process streaming token fragments here; ignore SSE events without a
         // token field.
         // Other parsed messages (e.g., assistant_message_id updates) are already
@@ -258,7 +286,12 @@ const AppContent = () => {
 
     // Close SSE connection on error and display a system message.
     es.onerror = (evt) => {
-      if (es.readyState === EventSource.CLOSED) return;
+      // If the connection is already closed, this is likely a normal completion, not an
+      // error
+      if (es.readyState === EventSource.CLOSED) {
+        console.log("SSE connection closed normally.");
+        return;
+      }
       console.error("SSE error: connection lost", evt);
       handleClose(true);
       setCurrentConversation((prev) => ({
@@ -283,6 +316,20 @@ const AppContent = () => {
     } catch (error) {
       console.error("Error updating conversation topic:", error);
     }
+  };
+
+  // Start a brand new conversation and reset UI state.
+  const handleNewConversation = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setIsStreaming(false);
+    setEditState({ id: null, text: "" });
+    setCurrentConversation({ id: null, messages: [], systemMessage: "" });
+    setCurrentUserInput("");
+    setSelectedParentId(null);
+    setSelectedLLM(""); // Reset model selector to "Select a model..."
   };
 
   // Load messages for selected conversation and reset any active stream, unless
@@ -312,7 +359,15 @@ const AppContent = () => {
           )}
         </div>
         <div className="header-auth">
-          <LoginButton />
+          <LoginButton highlight={loginHighlight} />
+          {isAuthenticated && (
+            <button
+              className="settings-button"
+              onClick={() => setShowSettings(true)}
+            >
+              Settings
+            </button>
+          )}
         </div>
       </div>
       <StreamingIndicator isVisible={isStreaming} />
@@ -324,17 +379,25 @@ const AppContent = () => {
           onSelectConversation={handleConversationSelected}
           isDeleteMode={isDeleteMode}
           onDeleteConversation={handleDeleteConversation}
+          onNewConversation={handleNewConversation}
         />
         <InteractionArea
           onSubmit={handleSubmit}
           messagesEndRef={messagesEndRef}
+          isAuthenticated={isAuthenticated}
+          onRequireAuth={triggerLoginHighlight}
         />
-        <ControlPanel />
+        <ControlPanel
+          isAuthenticated={isAuthenticated}
+          onRequireAuth={triggerLoginHighlight}
+        />
       </div>
     </>
   );
 };
 
+// Wrap the app with AuthProvider and ConversationProvider so that any component in the
+// tree can access authentication and conversation context via hooks.
 const App = () => (
   <AuthProvider>
     <ConversationProvider>

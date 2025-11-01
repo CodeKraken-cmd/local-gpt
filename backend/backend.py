@@ -7,11 +7,14 @@ Provides endpoints for:
 - database connection pooling and CORS preflight handling.
 """
 
-from datetime import datetime, timedelta
+import datetime as dt
+from datetime import datetime
+import dotenv
 import functools
 import json
 import pathlib
 import os
+from os import environ
 
 import anthropic
 import bcrypt
@@ -23,28 +26,23 @@ import jwt
 import openai
 import psycopg2.extensions, psycopg2.extras, psycopg2.pool
 
+dotenv.load_dotenv()
 
 ## Connection pool for PostgreSQL database.
-postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(
-    1,
-    20,
-    user="seth",
-    password="newpassword",
-    host="localhost",
-    port="5432",
-    database="local-gpt",
-)
+DATABASE_URL = os.getenv('DATABASE_URL')
+postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
 
-
-FLASK_APP = flask.Flask(__name__)
-flask_cors.CORS(FLASK_APP)
+ROOT_DIR = pathlib.Path(__file__).resolve().parent
+APP = flask.Flask(__name__, static_folder=ROOT_DIR.parent / "dist", static_url_path="")
+flask_cors.CORS(APP)
 
 # JWT configuration
-JWT_SECRET_KEY = os.environ.get(
-    'JWT_SECRET_KEY', 'your-secret-key-change-in-production'
-)
+JWT_SECRET_KEY = environ.get('JWT_SECRET_KEY')
 JWT_ALGORITHM = 'HS256'
 
+# Fail fast if JWT secret not configured
+if not JWT_SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY environment variable must be set")
 
 OPENAI = openai.OpenAI()
 OPEN_AI_CHAT_COMPLETIONS_CLIENT = OPENAI.chat.completions
@@ -56,9 +54,7 @@ MODEL_CONFIG = json.loads(config_filepath.read_text())
 ANTHROPIC_CLIENT = anthropic.Anthropic()
 MAX_ANTHROPIC_TOKENS = 8192
 ANTHROPIC_MODELS = set(MODEL_CONFIG["anthropic_models"])
-
 OPENAI_MODELS = set(MODEL_CONFIG["openai_models"])
-
 REASONING_MODELS = set(MODEL_CONFIG["reasoning_models"])
 
 
@@ -76,7 +72,7 @@ def verify_password(password: str, hashed: str) -> bool:
 def generate_token(user_id: int, email: str, is_admin: bool) -> str:
     """
     Generate a JWT token for a user.
-    
+
     JWT tokens are used instead of sessions because:
     - They're stateless (no server-side storage needed)
     - They contain user info (id, email, admin status) for quick access
@@ -87,7 +83,8 @@ def generate_token(user_id: int, email: str, is_admin: bool) -> str:
         'user_id': user_id,
         'email': email,
         'is_admin': is_admin,
-        'exp': datetime.utcnow() + timedelta(days=7),  # Token expires in 7 days
+        # Token expires in 7 days
+        'exp': datetime.now(dt.UTC) + dt.timedelta(days=7),
     }
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
@@ -95,9 +92,9 @@ def generate_token(user_id: int, email: str, is_admin: bool) -> str:
 def verify_token(token: str) -> dict | None:
     """
     Verify and decode a JWT token.
-    
-    This function is called on every protected route and during app startup
-    to ensure tokens are still valid and haven't expired.
+
+    This function is called on every protected route and during app startup to ensure
+    tokens are still valid and haven't expired.
     Returns None for expired or invalid tokens, triggering re-authentication.
     """
     try:
@@ -110,20 +107,63 @@ def verify_token(token: str) -> dict | None:
 
 
 def require_auth(f):
-    """Decorator to require authentication for an endpoint."""
+    """
+    Decorator to enforce that a valid JWT is present on protected endpoints. This wraps
+    the view function, extracting a token (from the Authorization header or a 'token'
+    query param), verifies it, and populates flask_request.current_user. If the token is
+    missing or invalid, returns a 401 error response before calling the endpoint.
+    Example usage:
+
+        @APP.route('/some-protected')
+        @require_auth
+        def some_protected_view():
+            # flask_request.current_user is guaranteed to be set here
+            return jsonify(...)
+    """
 
     @functools.wraps(f)
     def decorated_function(*args, **kwargs):
+        # Look for token in header first, then fallback to query string
         auth_header = flask_request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+        else:
+            token = flask_request.args.get('token')
+        if not token:
             return flask.jsonify({'error': 'No token provided'}), 401
 
-        token = auth_header.split(' ')[1]
         payload = verify_token(token)
         if not payload:
             return flask.jsonify({'error': 'Invalid or expired token'}), 401
 
         flask_request.current_user = payload
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def optional_auth(f):
+    """
+    Decorator for endpoints that accept both authenticated and anonymous users.
+
+    Attempts to parse a JWT from the Authorization header; on success, sets
+    flask_request.current_user but does not reject if no or invalid token is present.
+    Use this for endpoints like /api/conversations that should work for both cases.
+    """
+
+    @functools.wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = flask_request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+            payload = verify_token(token)
+            if payload:
+                flask_request.current_user = payload
+            else:
+                flask_request.current_user = None
+        else:
+            flask_request.current_user = None
+
         return f(*args, **kwargs)
 
     return decorated_function
@@ -149,7 +189,8 @@ def _anthropic_call(
     return ANTHROPIC_CLIENT.messages.create(**params)
 
 
-@FLASK_APP.route("/stream", methods=["GET"])
+@APP.route("/stream", methods=["GET"])
+@require_auth
 def stream_interaction() -> flaskResponse:
     """
     Stream an OpenAI or Anthropic LLM response via Server-Sent Events (SSE).
@@ -240,10 +281,10 @@ def stream_interaction() -> flaskResponse:
             conversation_topic = _get_current_date_and_time_string()
             cur.execute(
                 """
-                INSERT INTO conversations (conversation_topic)
-                VALUES (%s) RETURNING id
-                """,
-                (conversation_topic,),
+            INSERT INTO conversations (conversation_topic, user_id)
+            VALUES (%s, %s) RETURNING id
+            """,
+                (conversation_topic, flask_request.current_user['user_id']),
             )
             conversation_id_row = cur.fetchone()
             if not conversation_id_row:
@@ -416,18 +457,28 @@ def stream_interaction() -> flaskResponse:
                     f"Skipping final save for conv {conv_id}: No assistant text generated."
                 )
 
+        # Send completion signal to frontend
+        completion_data = json.dumps({"stream_complete": True})
+        yield f"data: {completion_data}\n\n"
+
     return flask.Response(
         generate(conversation_id, llm_choice), mimetype="text/event-stream"
     )
 
 
-@FLASK_APP.route("/api/conversations", methods=['GET'])
+@APP.route("/api/conversations", methods=['GET'])
+@optional_auth
 def get_conversations() -> flaskResponse:
     """
     GET /api/conversations
 
     Return a list of all conversations with their IDs and topics.
+    If user is not authenticated, return empty list.
     """
+    # If no user is authenticated, return empty list
+    if not flask_request.current_user:
+        return flask.jsonify([])
+
     conn = None
     cur = None
     try:
@@ -437,8 +488,10 @@ def get_conversations() -> flaskResponse:
             """
             SELECT id, conversation_topic
             FROM conversations
+            WHERE user_id = %s
             ORDER BY created_at DESC
-            """
+            """,
+            (flask_request.current_user['user_id'],),
         )
         conversations = cur.fetchall()
         return flask.jsonify(
@@ -453,7 +506,8 @@ def get_conversations() -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/messages/<int:conversation_id>", methods=['GET'])
+@APP.route("/api/messages/<int:conversation_id>", methods=['GET'])
+@require_auth
 def get_messages(conversation_id: int) -> flaskResponse:
     """
     GET /api/messages/<conversation_id>
@@ -465,6 +519,13 @@ def get_messages(conversation_id: int) -> flaskResponse:
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Ensure conversation belongs to current user
+        cur.execute(
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
+            (conversation_id, flask_request.current_user['user_id']),
+        )
+        if cur.fetchone() is None:
+            return flask.jsonify({'error': 'Not found'}), 404
         cur.execute(
             """
             SELECT 
@@ -505,7 +566,8 @@ def get_messages(conversation_id: int) -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/conversations/<int:id>", methods=['PUT'])
+@APP.route("/api/conversations/<int:id>", methods=['PUT'])
+@require_auth
 def update_conversation(id: int) -> flaskResponse:
     """
     PUT /api/conversations/<id>
@@ -518,6 +580,13 @@ def update_conversation(id: int) -> flaskResponse:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Ensure conversation belongs to current user
+        cur.execute(
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
+            (id, flask_request.current_user['user_id']),
+        )
+        if cur.fetchone() is None:
+            return flask.jsonify({'error': 'Not found'}), 404
         cur.execute(
             'UPDATE conversations SET conversation_topic = %s WHERE id = %s',
             (topic, id),
@@ -535,7 +604,8 @@ def update_conversation(id: int) -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/conversations/<int:id>", methods=['DELETE'])
+@APP.route("/api/conversations/<int:id>", methods=['DELETE'])
+@require_auth
 def delete_conversation(id: int) -> flaskResponse:
     """
     DELETE /api/conversations/<id>
@@ -547,6 +617,13 @@ def delete_conversation(id: int) -> flaskResponse:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Ensure conversation belongs to current user
+        cur.execute(
+            "SELECT 1 FROM conversations WHERE id = %s AND user_id = %s",
+            (id, flask_request.current_user['user_id']),
+        )
+        if cur.fetchone() is None:
+            return flask.jsonify({'error': 'Not found'}), 404
         cur.execute("DELETE FROM messages WHERE conversation_id = %s", (id,))
         cur.execute("DELETE FROM conversations WHERE id = %s", (id,))
         conn.commit()
@@ -562,7 +639,7 @@ def delete_conversation(id: int) -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/auth/register", methods=['POST'])
+@APP.route("/api/auth/register", methods=['POST'])
 def register() -> flaskResponse:
     """
     POST /api/auth/register
@@ -624,7 +701,7 @@ def register() -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/auth/login", methods=['POST'])
+@APP.route("/api/auth/login", methods=['POST'])
 def login() -> flaskResponse:
     """
     POST /api/auth/login
@@ -674,7 +751,7 @@ def login() -> flaskResponse:
             release_db_connection(conn)
 
 
-@FLASK_APP.route("/api/auth/me", methods=['GET'])
+@APP.route("/api/auth/me", methods=['GET'])
 @require_auth
 def get_current_user() -> flaskResponse:
     """
@@ -682,16 +759,91 @@ def get_current_user() -> flaskResponse:
 
     Get current user information from token.
     """
+    # Retrieve up-to-date API keys from the database (token payload does not include them)
     user = flask_request.current_user
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT openai_api_key, anthropic_api_key FROM users WHERE id = %s",
+            (user['user_id'],),
+        )
+        row = cur.fetchone() or (None, None)
+        openai_key, anthropic_key = row
+    except Exception as e:
+        print(f"Error loading user API keys for user_id={user['user_id']}: {e}")
+        openai_key = None
+        anthropic_key = None
+    finally:
+        if conn:
+            cur.close()
+            release_db_connection(conn)
+
     return flask.jsonify(
         {
             'user': {
                 'id': user['user_id'],
                 'email': user['email'],
                 'is_admin': user['is_admin'],
+                'openai_api_key': openai_key,
+                'anthropic_api_key': anthropic_key,
             }
         }
     )
+
+
+@APP.route("/api/auth/keys", methods=['PUT'])
+@require_auth
+def update_user_keys() -> flaskResponse:
+    """
+    PUT /api/auth/keys
+    Update the current user's API keys.
+    """
+    data = flask_request.get_json() or {}
+    openai_key = data.get('openai_api_key')
+    anthropic_key = data.get('anthropic_api_key')
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users "
+            "SET openai_api_key = %s, anthropic_api_key = %s "
+            "WHERE id = %s",
+            (openai_key, anthropic_key, flask_request.current_user['user_id']),
+        )
+        conn.commit()
+        return flask.jsonify({'success': True})
+    except Exception as e:
+        print("Error updating user keys:", e)
+        if conn:
+            conn.rollback()
+        return flask.jsonify({'error': 'Internal Server Error'}), 500
+    finally:
+        if conn:
+            cur.close()
+            release_db_connection(conn)
+
+
+@APP.route("/", defaults={"requested_path": ""})
+@APP.route("/<path:requested_path>")
+def serve_spa(requested_path: str):
+    """
+    Serve static files built by Vite or fall back to index.html so React Router deep
+    links work in production.
+    """
+    full_path = pathlib.Path(APP.static_folder) / requested_path
+
+    if requested_path and full_path.exists():
+        # Path points to an actual file inside frontend/dist `flask.send_from_directory`
+        # still needs string paths.
+        return flask.send_from_directory(APP.static_folder, requested_path)
+
+    # Otherwise send index.html for SPA routing
+    return flask.send_from_directory(APP.static_folder, "index.html")
 
 
 def _get_current_date_and_time_string() -> str:
@@ -711,4 +863,4 @@ def release_db_connection(conn: psycopg2.extensions.connection) -> None:
 
 
 if __name__ == '__main__':
-    FLASK_APP.run(port=5005, debug=True)
+    APP.run(port=5005, debug=True)

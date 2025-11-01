@@ -7,9 +7,15 @@ import { useState } from "react";
 import ChatMessage from "./ChatMessage";
 import { useConversation } from "../contexts/ConversationContext";
 import { OPENAI_MODELS, ANTHROPIC_MODELS } from "../constants";
+import { useAuth } from "../contexts/AuthContext";
 import "./InteractionArea.css";
 
-const InteractionArea = ({ onSubmit, messagesEndRef }) => {
+const InteractionArea = ({
+  onSubmit,
+  messagesEndRef,
+  isAuthenticated,
+  onRequireAuth,
+}) => {
   const {
     currentConversation,
     currentUserInput,
@@ -19,6 +25,7 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
     selectedParentId,
     setSelectedParentId,
   } = useConversation();
+  const { user } = useAuth();
   const { messages } = currentConversation;
   // collapsedNodes: a set of message IDs whose child branches are currently collapsed
   // (hidden)
@@ -26,6 +33,17 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
   // collapsedMessages: map of message IDs to boolean flags indicating whether each
   // message's own text content is collapsed (true=show truncated text)
   const [collapsedMessages, setCollapsedMessages] = useState(() => new Map());
+
+  // Collapse all messages' text content in the current conversation.
+  const handleCollapseAll = () => {
+    const next = new Map();
+    messages.forEach((m) => {
+      if (m && m.id != null) {
+        next.set(m.id, true);
+      }
+    });
+    setCollapsedMessages(next);
+  };
 
   /**
    * Build lookup maps for efficient tree traversal:
@@ -119,20 +137,26 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
       if (!isCollapsed && msg.id != null && !visited.has(msg.id)) {
         const nextVisited = new Set(visited);
         nextVisited.add(msg.id);
-        nodes.push(
-          ...renderNodes(msg.id, nextIndent, nextVisited)
-        );
+        nodes.push(...renderNodes(msg.id, nextIndent, nextVisited));
       }
     });
     return nodes;
   };
 
   const handleTextChange = (e) => {
+    if (!isAuthenticated) {
+      onRequireAuth();
+      return;
+    }
     setCurrentUserInput(e.target.value);
   };
 
   // Submit on Enter when Shift is not held.
   const handleKeyDown = (e) => {
+    if (!isAuthenticated) {
+      onRequireAuth();
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       onSubmit();
@@ -145,6 +169,16 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
 
   return (
     <div className="current-llm-interaction">
+      <div className="message-list-header">
+        <button
+          className="collapse-all-button"
+          onClick={handleCollapseAll}
+          disabled={!messages || messages.length === 0}
+          title="Collapse all messages"
+        >
+          Collapse all
+        </button>
+      </div>
       <div className="message-list">
         {/* Display messages or placeholder when no conversation is selected. */}
         {messages && messages.length > 0 ? (
@@ -179,16 +213,27 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
             value={selectedLLM}
             onChange={handleLLMChange}
           >
+            <option value="" disabled>
+              Select a model...
+            </option>
             <optgroup label="OpenAI">
               {OPENAI_MODELS.map((model) => (
-                <option key={model} value={model}>
+                <option
+                  key={model}
+                  value={model}
+                  disabled={!user?.openai_api_key}
+                >
                   {model}
                 </option>
               ))}
             </optgroup>
             <optgroup label="Anthropic">
               {ANTHROPIC_MODELS.map((model) => (
-                <option key={model} value={model}>
+                <option
+                  key={model}
+                  value={model}
+                  disabled={!user?.anthropic_api_key}
+                >
                   {model}
                 </option>
               ))}
@@ -198,7 +243,7 @@ const InteractionArea = ({ onSubmit, messagesEndRef }) => {
           <button
             className="submit-button"
             onClick={onSubmit}
-            disabled={!currentUserInput.trim()}
+            disabled={!currentUserInput.trim() || !selectedLLM}
           >
             Send
           </button>
